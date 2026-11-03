@@ -131,8 +131,11 @@ object SyncRuntime {
         update { it.copy(running = true, error = null) }
 
         s.launch {
-            pairing = withContext(Dispatchers.IO) { Prefs(ctx).pairing() }
-            publishPairing(pairing!!)
+            val saved = withContext(Dispatchers.IO) { Prefs(ctx).pairing() }
+            // A browser code scanned while this read ran is newer; keep it.
+            val p = pairing ?: saved
+            pairing = p
+            publishPairing(p)
             selectInstall(ctx)
             try {
                 server = LanServer(LanServer.PORT, s, ::handleRpc).also { it.start() }
