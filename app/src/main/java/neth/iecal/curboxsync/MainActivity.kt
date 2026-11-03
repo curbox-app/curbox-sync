@@ -6,41 +6,40 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.text.format.DateUtils
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import android.widget.Toast
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.animation.Crossfade
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import neth.iecal.curboxsync.ui.Gutter
+import neth.iecal.curboxsync.ui.SyncActions
+import neth.iecal.curboxsync.ui.SyncScreen
+import neth.iecal.curboxsync.ui.Tabs
+import neth.iecal.curboxsync.ui.UsageScreen
 import neth.iecal.curboxsync.ui.theme.CurboxSyncTheme
 
 class MainActivity : ComponentActivity() {
@@ -57,26 +56,32 @@ class MainActivity : ComponentActivity() {
 
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
+    private val actions by lazy {
+        SyncActions(
+            onToggle = { on -> if (on) SyncService.start(this) else SyncService.stop(this) },
+            onApprove = ::requestApproval,
+            onChoose = SyncRuntime::choose,
+            onUnpairAll = SyncRuntime::newCode,
+            onBattery = ::openBatterySettings,
+            onScan = ::scanBrowserCode,
+            onRename = { id, label -> SyncRuntime.renameNetwork(this, id, label) },
+            onForget = { id -> SyncRuntime.forgetNetwork(this, id) },
+        )
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         if (Prefs(this).enabled) SyncService.start(this)
         if (Build.VERSION.SDK_INT >= 33) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         handlePairingLink(intent)
+        SyncRuntime.loadNetworks(this)
         setContent {
             CurboxSyncTheme {
                 val status by SyncRuntime.status.collectAsStateWithLifecycle()
-                Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    Screen(
-                        status = status,
-                        modifier = Modifier.padding(padding),
-                        onToggle = { on -> if (on) SyncService.start(this) else SyncService.stop(this) },
-                        onApprove = ::requestApproval,
-                        onChoose = SyncRuntime::choose,
-                        onNewCode = SyncRuntime::newCode,
-                        onBattery = ::openBatterySettings,
-                        onScan = ::scanBrowserCode,
-                    )
+                val usage by SyncRuntime.usage(this).snapshot.collectAsStateWithLifecycle()
+                Scaffold(modifier = Modifier.fillMaxSize(), containerColor = MaterialTheme.colorScheme.background) { padding ->
+                    Home(status, usage, actions, padding)
                 }
             }
         }
@@ -128,139 +133,23 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun Screen(
-    status: SyncStatus,
-    modifier: Modifier,
-    onToggle: (Boolean) -> Unit,
-    onApprove: () -> Unit,
-    onChoose: (String) -> Unit,
-    onNewCode: () -> Unit,
-    onBattery: () -> Unit,
-    onScan: () -> Unit,
-) {
+private fun Home(status: SyncStatus, usage: UsageSnapshot, actions: SyncActions, padding: PaddingValues) {
+    var tab by rememberSaveable { mutableIntStateOf(0) }
     Column(
-        modifier = modifier
+        Modifier
             .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
             .verticalScroll(rememberScrollState())
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+            .padding(padding)
+            .padding(horizontal = Gutter)
+            .padding(bottom = 32.dp),
     ) {
-        Text("Curbox Sync", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-        Text(
-            "Keeps focus mode in step between Curbox on this phone and the Curbox browser extension, over your WiFi.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-
-        Section("Sync") {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(if (status.running) "On" else "Off", modifier = Modifier.weight(1f))
-                Switch(checked = status.running, onCheckedChange = onToggle)
-            }
-            status.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Curbox Sync", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+            Tabs(listOf("Sync", "Usage"), tab, { tab = it })
         }
-
-        Section("Curbox on this phone") { CurboxAccessRows(status, onApprove, onChoose) }
-
-        if (status.running) {
-            Section("Pair your browser") {
-                Text("In the Curbox extension open Reducers, then Phone over WiFi. Scan the code it shows.")
-                Button(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan browser code") }
-                Text(
-                    when (status.browsers) {
-                        0 -> "No browser paired yet."
-                        1 -> "1 browser paired."
-                        else -> "${status.browsers} browsers paired."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                if (status.addresses.isNotEmpty()) {
-                    Label("Or type this into the browser")
-                    status.addresses.forEach { Mono(it) }
-                    Mono(status.code)
-                }
-                TextButton(onClick = onNewCode) { Text("Unpair all browsers") }
-            }
-
-            Section("Status") {
-                val phone = status.phone
-                Text(
-                    if (phone.active) "Focus on: ${phone.name.ifEmpty { "Focus" }}, ends ${
-                        DateUtils.getRelativeTimeSpanString(phone.endsAt)
-                    }" else "Focus is off"
-                )
-                Text(
-                    if (status.lastBrowserAt == 0L) "No browser has connected yet"
-                    else "Browser last seen ${DateUtils.getRelativeTimeSpanString(status.lastBrowserAt)}"
-                )
-                if (status.lastEvent.isNotEmpty()) Text(status.lastEvent, style = MaterialTheme.typography.bodySmall)
-            }
+        Crossfade(tab, label = "tab") { t ->
+            if (t == 0) SyncScreen(status, actions) else UsageScreen(usage)
         }
-
-        Section("Stay connected") {
-            Text(
-                "Let Curbox Sync run in the background so the browser can reach it while the screen is off.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            OutlinedButton(onClick = onBattery) { Text("Battery settings") }
-        }
-    }
-}
-
-@Composable
-private fun CurboxAccessRows(status: SyncStatus, onApprove: () -> Unit, onChoose: (String) -> Unit) {
-    val phone = status.phone
-    when {
-        status.installs.isEmpty() -> Text("Curbox is not installed, or it is too old to offer its API.")
-        status.selectedPackage == null -> {
-            Text("More than one Curbox is installed. Pick the one to sync:")
-            status.installs.forEach { install ->
-                OutlinedButton(onClick = { onChoose(install.packageName) }, modifier = Modifier.fillMaxWidth()) {
-                    Text("${install.label} (${install.packageName})")
-                }
-            }
-        }
-        !status.running -> Text("Turn sync on to connect.")
-        phone.access == CurboxAccess.NEEDS_APPROVAL -> {
-            Text("Curbox needs to allow this app. Allowing it lets this app start and stop focus mode and read your focus groups.")
-            Button(onClick = onApprove) { Text("Allow in Curbox") }
-        }
-        phone.access == CurboxAccess.READY -> {
-            Text("Connected to ${status.selectedPackage} (API ${phone.apiVersion})")
-            Text("${phone.groups.size} focus groups found")
-            if (phone.apiVersion < 4) {
-                Text(
-                    "Update Curbox for exact end times. This version only shares whole minutes.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-        else -> Text("Connecting to ${status.selectedPackage}…")
-    }
-    if (status.installs.size > 1 && status.selectedPackage != null) {
-        status.installs.filter { it.packageName != status.selectedPackage }.forEach { install ->
-            TextButton(onClick = { onChoose(install.packageName) }) { Text("Use ${install.label} instead") }
-        }
-    }
-}
-
-@Composable
-private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            content()
-        }
-    }
-}
-
-@Composable
-private fun Label(text: String) {
-    Text(text, style = MaterialTheme.typography.labelMedium)
-}
-
-@Composable
-private fun Mono(text: String) {
-    SelectionContainer {
-        Text(text, fontFamily = FontFamily.Monospace, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
     }
 }
