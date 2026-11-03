@@ -1,9 +1,15 @@
 package neth.iecal.curboxsync.ui
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -17,10 +23,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import neth.iecal.curboxsync.CurboxAccess
-import neth.iecal.curboxsync.SavedNetwork
-import neth.iecal.curboxsync.SyncStatus
-import neth.iecal.curboxsync.UsageMath
 import neth.iecal.curboxsync.ui.theme.Mono
 
 class SyncActions(
@@ -30,68 +32,51 @@ class SyncActions(
     val onUnpairAll: () -> Unit,
     val onBattery: () -> Unit,
     val onScan: () -> Unit,
-    val onRename: (String, String) -> Unit,
+    val onRename: (NetUi) -> Unit,
     val onForget: (String) -> Unit,
+    val onToggleManual: () -> Unit,
 )
 
-private const val RECENT_MS = 90_000L
-
-@Composable
-fun SyncScreen(status: SyncStatus, actions: SyncActions) {
-    val phone = status.phone
-    val now = System.currentTimeMillis()
-    val browserRecent = status.lastBrowserAt > 0 && now - status.lastBrowserAt < RECENT_MS
-    val big = when {
-        !status.running -> "Off"
-        phone.access != CurboxAccess.READY -> "Not ready"
-        status.browsers == 0 -> "Not paired"
-        browserRecent -> "In step"
-        else -> "Waiting"
-    }
-    val sub = when {
-        !status.running -> "Turn sync on to share focus with your browser"
-        phone.active -> "${phone.name.ifEmpty { "Focus" }} · ${UsageMath.format(phone.endsAt - now)} left"
-        phone.access == CurboxAccess.READY -> "Focus is off"
-        else -> null
-    }
-    var renaming by rememberSaveable { mutableStateOf<String?>(null) }
-    var showManual by rememberSaveable { mutableStateOf(false) }
-
-    Column(Modifier.fillMaxWidth()) {
-        Hero(label = "WiFi sync", big = big, sub = sub)
-        if (status.running) {
-            PillButton("Scan browser code", actions.onScan, Modifier.fillMaxWidth().padding(top = 24.dp))
-        } else {
-            PillButton("Turn on", { actions.onToggle(true) }, Modifier.fillMaxWidth().padding(top = 24.dp))
+fun LazyListScope.syncContent(ui: SyncUi, showManual: Boolean, actions: SyncActions) {
+    item(key = "s-hero", contentType = "hero") {
+        AnimatedContent(ui.big to ui.sub, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "state") { (big, sub) ->
+            Hero(label = "WiFi sync", big = big.ifEmpty { " " }, sub = sub)
         }
-        status.error?.let {
-            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 12.dp))
+    }
+    item(key = "s-cta", contentType = "cta") {
+        if (ui.running) PillButton("Scan browser code", actions.onScan, Modifier.fillMaxWidth().padding(top = 24.dp))
+        else PillButton("Turn on", { actions.onToggle(true) }, Modifier.fillMaxWidth().padding(top = 24.dp))
+    }
+    ui.error?.let { error ->
+        item(key = "s-error", contentType = "note") {
+            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 12.dp))
         }
+    }
 
-        SectionLabel("This phone")
-        CurboxRow(status, actions)
+    item(key = "s-phone-label", contentType = "label") { SectionLabel("This phone") }
+    item(key = "s-curbox", contentType = "row") {
         ListRow(
-            title = when (status.browsers) {
-                0 -> "No browser paired"
-                1 -> "1 browser paired"
-                else -> "${status.browsers} browsers paired"
-            },
-            subtitle = if (status.lastBrowserAt == 0L) "Open Reducers, then Phone over WiFi, in the extension"
-            else "Last seen ${ago(status.lastBrowserAt)}",
-            leading = { Initial("B") },
+            ui.curbox.title, ui.curbox.subtitle,
+            leading = { Initial("C") },
+            onClick = if (ui.curbox.approve) actions.onApprove else null,
+            trailing = if (ui.curbox.approve) ({ QuietButton("Allow", actions.onApprove) }) else null,
         )
-        status.network?.let { net ->
-            val saved = status.networks.firstOrNull { it.id == net.id }
-            ListRow(
-                title = saved?.label ?: net.defaultLabel,
-                subtitle = if (saved != null) "Current network · saved" else "Current network · saved after the first sync",
-                leading = { Initial("W") },
-                trailing = { TrailingText(net.address.substringBefore(':')) },
-            )
+    }
+    items(ui.pick + ui.alternatives, key = { "pkg:${it.packageName}" }, contentType = { "row" }) { c ->
+        ListRow(c.label, c.packageName, onClick = { actions.onChoose(c.packageName) })
+    }
+    item(key = "s-browsers", contentType = "row") {
+        ListRow(ui.browsersTitle, ui.browsersSub, leading = { Initial("B") })
+    }
+    ui.currentNet?.let { net ->
+        item(key = "s-current-net", contentType = "row") {
+            ListRow(net.label, "Current network · ${net.subtitle}", leading = { Initial("W") })
         }
+    }
 
-        SectionLabel("Saved networks")
-        if (status.networks.isEmpty()) {
+    item(key = "s-nets-label", contentType = "label") { SectionLabel("Saved networks") }
+    if (ui.loaded && ui.networks.isEmpty()) {
+        item(key = "s-nets-empty", contentType = "note") {
             Text(
                 "Each WiFi you sync on is kept here, so your browser finds this phone again when you move between home, work or a hotspot.",
                 style = MaterialTheme.typography.bodyMedium,
@@ -99,38 +84,53 @@ fun SyncScreen(status: SyncStatus, actions: SyncActions) {
                 modifier = Modifier.padding(vertical = 8.dp),
             )
         }
-        status.networks.forEach { n ->
-            NetworkRow(n, current = n.id == status.network?.id, onRename = { renaming = n.id }, onForget = { actions.onForget(n.id) })
-        }
+    }
+    items(ui.networks, key = { "net:${it.id}" }, contentType = { "net" }) { n ->
+        ListRow(
+            title = n.label,
+            subtitle = n.subtitle,
+            leading = { Initial(n.label, if (n.current) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh) },
+            onClick = { actions.onRename(n) },
+            trailing = { QuietButton("Forget", { actions.onForget(n.id) }, MaterialTheme.colorScheme.onSurfaceVariant) },
+            modifier = Modifier.animateItem(),
+        )
+    }
 
-        if (status.running && status.addresses.isNotEmpty()) {
-            SectionLabel("Pair by typing")
-            ListRow(
-                title = if (showManual) "Hide address and code" else "Show address and code",
-                subtitle = "For a browser that cannot scan",
-                onClick = { showManual = !showManual },
-            )
-            AnimatedVisibility(showManual) {
-                Column(Modifier.padding(start = 4.dp, top = 4.dp, bottom = 8.dp)) {
+    if (ui.addresses.isNotEmpty()) {
+        item(key = "s-manual-label", contentType = "label") { SectionLabel("Pair by typing") }
+        item(key = "s-manual", contentType = "manual") {
+            Column {
+                ListRow(
+                    title = if (showManual) "Hide address and code" else "Show address and code",
+                    subtitle = "For a browser that cannot scan",
+                    onClick = actions.onToggleManual,
+                )
+                AnimatedVisibility(showManual) {
                     SelectionContainer {
-                        Column {
-                            status.addresses.forEach { Text(it, style = Mono, color = MaterialTheme.colorScheme.onSurface) }
-                            Text(status.code, style = Mono, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp))
+                        Column(Modifier.padding(start = 4.dp, top = 4.dp, bottom = 8.dp)) {
+                            ui.addresses.forEach { Text(it, style = Mono, color = MaterialTheme.colorScheme.onSurface) }
+                            Text(ui.code, style = Mono, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp))
                         }
                     }
                 }
             }
         }
+    }
 
-        SectionLabel("Settings")
+    item(key = "s-settings-label", contentType = "label") { SectionLabel("Settings") }
+    item(key = "s-toggle", contentType = "row") {
         ListRow(
             title = "Sync over WiFi",
             subtitle = "Runs quietly while the screen is off",
-            onClick = { actions.onToggle(!status.running) },
-            trailing = { Switch(checked = status.running, onCheckedChange = actions.onToggle) },
+            onClick = { actions.onToggle(!ui.running) },
+            trailing = { Switch(checked = ui.running, onCheckedChange = actions.onToggle) },
         )
+    }
+    item(key = "s-battery", contentType = "row") {
         ListRow(title = "Battery", subtitle = "Let Curbox Sync run in the background", onClick = actions.onBattery)
-        if (status.browsers > 0) {
+    }
+    if (ui.canUnpair) {
+        item(key = "s-unpair", contentType = "row") {
             ListRow(
                 title = "Unpair all browsers",
                 subtitle = "They need to scan a new code",
@@ -138,77 +138,22 @@ fun SyncScreen(status: SyncStatus, actions: SyncActions) {
                 titleColor = MaterialTheme.colorScheme.error,
             )
         }
-        if (status.lastEvent.isNotEmpty()) {
+    }
+    if (ui.lastEvent.isNotEmpty()) {
+        item(key = "s-event", contentType = "note") {
             Text(
-                status.lastEvent,
+                ui.lastEvent,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 20.dp),
             )
         }
     }
-
-    renaming?.let { id ->
-        val n = status.networks.firstOrNull { it.id == id }
-        if (n == null) renaming = null else RenameDialog(n, onDone = { label ->
-            if (label != null) actions.onRename(id, label)
-            renaming = null
-        })
-    }
 }
 
 @Composable
-private fun CurboxRow(status: SyncStatus, actions: SyncActions) {
-    val phone = status.phone
-    when {
-        status.installs.isEmpty() -> ListRow("Curbox not found", "Install Curbox, or update it to a version with its API", leading = { Initial("C") })
-        status.selectedPackage == null -> {
-            ListRow("Pick a Curbox", "More than one is installed", leading = { Initial("C") })
-            status.installs.forEach { i -> ListRow(i.label, i.packageName, onClick = { actions.onChoose(i.packageName) }) }
-        }
-        !status.running -> ListRow("Curbox", "Connects when sync is on", leading = { Initial("C") })
-        phone.access == CurboxAccess.NEEDS_APPROVAL -> ListRow(
-            "Curbox needs to allow this app",
-            "To start and stop focus and read usage",
-            leading = { Initial("C") },
-            onClick = actions.onApprove,
-            trailing = { QuietButton("Allow", actions.onApprove) },
-        )
-        phone.access == CurboxAccess.READY -> ListRow(
-            "Curbox",
-            buildString {
-                append("${phone.groups.size} focus groups · API ${phone.apiVersion}")
-                if (phone.apiVersion < 5) append(" · update for full usage")
-            },
-            leading = { Initial("C") },
-        )
-        else -> ListRow("Curbox", "Connecting", leading = { Initial("C") })
-    }
-    if (status.installs.size > 1 && status.selectedPackage != null) {
-        status.installs.filter { it.packageName != status.selectedPackage }.forEach { i ->
-            ListRow("Use ${i.label} instead", i.packageName, onClick = { actions.onChoose(i.packageName) })
-        }
-    }
-}
-
-@Composable
-private fun NetworkRow(n: SavedNetwork, current: Boolean, onRename: () -> Unit, onForget: () -> Unit) {
-    ListRow(
-        title = n.label,
-        subtitle = buildString {
-            append(n.address.substringBefore(':'))
-            append(" · ")
-            append(if (current) "here now" else "last synced ${ago(n.lastSeen)}")
-        },
-        leading = { Initial(n.label, if (current) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh) },
-        onClick = onRename,
-        trailing = { QuietButton("Forget", onForget, MaterialTheme.colorScheme.onSurfaceVariant) },
-    )
-}
-
-@Composable
-private fun RenameDialog(n: SavedNetwork, onDone: (String?) -> Unit) {
-    var text by rememberSaveable { mutableStateOf(n.label) }
+fun RenameDialog(net: NetUi, onDone: (String?) -> Unit) {
+    var text by rememberSaveable(net.id) { mutableStateOf(net.label) }
     AlertDialog(
         onDismissRequest = { onDone(null) },
         title = { Text("Name this network", style = MaterialTheme.typography.headlineSmall) },

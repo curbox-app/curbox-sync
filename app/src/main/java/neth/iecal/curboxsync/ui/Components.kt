@@ -1,6 +1,9 @@
 package neth.iecal.curboxsync.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -36,6 +39,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlin.math.abs
 
 val Gutter = 20.dp
 
@@ -70,10 +74,11 @@ fun ListRow(
     leading: (@Composable () -> Unit)? = null,
     onClick: (() -> Unit)? = null,
     titleColor: Color = MaterialTheme.colorScheme.onSurface,
+    modifier: Modifier = Modifier,
     trailing: (@Composable RowScope.() -> Unit)? = null,
 ) {
     Row(
-        Modifier
+        modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
@@ -171,37 +176,41 @@ fun Tabs(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier
     }
 }
 
-data class Bar(val label: String, val phone: Long, val browser: Long)
-
-/** Weekly bars split into phone and browser time, like Curbox's WeeklyBarGraphView. */
+/** Weekly bars split into phone and browser time, like Curbox's WeeklyBarGraphView. Heights ease between weeks. */
 @Composable
 fun WeekBars(bars: List<Bar>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
     val phoneColor = MaterialTheme.colorScheme.primary
     val browserColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.38f)
-    val faded = 0.45f
-    val max = bars.maxOfOrNull { it.phone + it.browser }?.coerceAtLeast(1L) ?: 1L
+    val emptyColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+    val max = (bars.maxOfOrNull { it.phone + it.browser } ?: 0L).coerceAtLeast(1L).toFloat()
+    val spec = spring<Float>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+    // Seven fixed slots, so the animations line up with bars across weeks.
+    val totals = List(7) { i -> animateFloatAsState(bars.getOrNull(i)?.let { (it.phone + it.browser) / max } ?: 0f, spec, label = "bar") }
+    val phones = List(7) { i -> animateFloatAsState(bars.getOrNull(i)?.let { b -> if (b.phone + b.browser == 0L) 0f else b.phone.toFloat() / (b.phone + b.browser) } ?: 0f, spec, label = "split") }
+    val pick = animateFloatAsState(selected.toFloat(), spec, label = "pick")
+    val count = bars.size.coerceAtLeast(1)
     Column(modifier.fillMaxWidth()) {
         Canvas(
-            Modifier.fillMaxWidth().height(150.dp).pointerInput(bars.size) {
-                detectTapGestures { p -> onSelect((p.x / (size.width / bars.size)).toInt().coerceIn(0, bars.lastIndex)) }
+            Modifier.fillMaxWidth().height(150.dp).pointerInput(count) {
+                detectTapGestures { p -> onSelect((p.x / (size.width / count)).toInt().coerceIn(0, count - 1)) }
             },
         ) {
-            val slot = size.width / bars.size
+            val slot = size.width / count
             val w = slot * 0.42f
             val r = CornerRadius(8.dp.toPx())
             val minH = 4.dp.toPx()
-            bars.forEachIndexed { i, b ->
+            for (i in 0 until count) {
                 val x = slot * i + (slot - w) / 2
-                val alpha = if (i == selected) 1f else faded
-                val total = b.phone + b.browser
-                if (total == 0L) {
-                    drawRoundRect(phoneColor.copy(alpha = 0.12f), Offset(x, size.height - minH), Size(w, minH), r)
-                    return@forEachIndexed
+                // The highlight glides to the picked day.
+                val alpha = 0.45f + 0.55f * (1f - abs(pick.value - i).coerceAtMost(1f))
+                val h = size.height * totals[i].value
+                if (h < minH) {
+                    drawRoundRect(emptyColor, Offset(x, size.height - minH), Size(w, minH), r)
+                    continue
                 }
-                val h = (size.height * total / max).coerceAtLeast(minH)
-                val ph = h * b.phone / total
                 drawRoundRect(browserColor.copy(alpha = browserColor.alpha * alpha), Offset(x, size.height - h), Size(w, h), r)
-                if (ph > 0f) drawRoundRect(phoneColor.copy(alpha = alpha), Offset(x, size.height - ph), Size(w, ph), r)
+                val ph = h * phones[i].value
+                if (ph > 0.5f) drawRoundRect(phoneColor.copy(alpha = alpha), Offset(x, size.height - ph), Size(w, ph), r)
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {

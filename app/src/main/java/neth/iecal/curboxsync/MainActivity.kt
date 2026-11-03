@@ -11,35 +11,51 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import neth.iecal.curboxsync.ui.Gutter
+import neth.iecal.curboxsync.ui.NetUi
+import neth.iecal.curboxsync.ui.RenameDialog
 import neth.iecal.curboxsync.ui.SyncActions
-import neth.iecal.curboxsync.ui.SyncScreen
 import neth.iecal.curboxsync.ui.Tabs
-import neth.iecal.curboxsync.ui.UsageScreen
+import neth.iecal.curboxsync.ui.UsageActions
+import neth.iecal.curboxsync.ui.syncContent
+import neth.iecal.curboxsync.ui.usageContent
 import neth.iecal.curboxsync.ui.theme.CurboxSyncTheme
 
 class MainActivity : ComponentActivity() {
@@ -56,18 +72,23 @@ class MainActivity : ComponentActivity() {
 
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-    private val actions by lazy {
+    private val vm: MainViewModel by viewModels()
+
+    private val syncActions by lazy {
         SyncActions(
             onToggle = { on -> if (on) SyncService.start(this) else SyncService.stop(this) },
             onApprove = ::requestApproval,
-            onChoose = SyncRuntime::choose,
-            onUnpairAll = SyncRuntime::newCode,
+            onChoose = vm::choose,
+            onUnpairAll = vm::unpairAll,
             onBattery = ::openBatterySettings,
             onScan = ::scanBrowserCode,
-            onRename = { id, label -> SyncRuntime.renameNetwork(this, id, label) },
-            onForget = { id -> SyncRuntime.forgetNetwork(this, id) },
+            onRename = {},
+            onForget = vm::forget,
+            onToggleManual = {},
         )
     }
+
+    private val usageActions by lazy { UsageActions(vm::selectDay, vm::previousWeek, vm::nextWeek) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,11 +99,7 @@ class MainActivity : ComponentActivity() {
         SyncRuntime.loadNetworks(this)
         setContent {
             CurboxSyncTheme {
-                val status by SyncRuntime.status.collectAsStateWithLifecycle()
-                val usage by SyncRuntime.usage(this).snapshot.collectAsStateWithLifecycle()
-                Scaffold(modifier = Modifier.fillMaxSize(), containerColor = MaterialTheme.colorScheme.background) { padding ->
-                    Home(status, usage, actions, padding)
-                }
+                Home(vm, syncActions, usageActions)
             }
         }
     }
@@ -133,23 +150,62 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun Home(status: SyncStatus, usage: UsageSnapshot, actions: SyncActions, padding: PaddingValues) {
+private fun Home(vm: MainViewModel, sync: SyncActions, usage: UsageActions) {
+    val syncUi by vm.sync.collectAsStateWithLifecycle()
+    val usageUi by vm.usage.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    var showManual by rememberSaveable { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf<NetUi?>(null) }
+    val syncList = rememberLazyListState()
+    val usageList = rememberLazyListState()
+    val actions = remember(sync) {
+        SyncActions(
+            onToggle = sync.onToggle, onApprove = sync.onApprove, onChoose = sync.onChoose,
+            onUnpairAll = sync.onUnpairAll, onBattery = sync.onBattery, onScan = sync.onScan,
+            onRename = { renaming = it }, onForget = sync.onForget, onToggleManual = { showManual = !showManual },
+        )
+    }
+
     Column(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .verticalScroll(rememberScrollState())
-            .padding(padding)
-            .padding(horizontal = Gutter)
-            .padding(bottom = 32.dp),
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
     ) {
-        Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = Gutter).padding(top = 12.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text("Curbox Sync", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
             Tabs(listOf("Sync", "Usage"), tab, { tab = it })
         }
-        Crossfade(tab, label = "tab") { t ->
-            if (t == 0) SyncScreen(status, actions) else UsageScreen(usage)
+        Crossfade(tab, animationSpec = tween(220), label = "tab") { t ->
+            LazyColumn(
+                state = if (t == 0) syncList else usageList,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = Gutter, end = Gutter, bottom = 32.dp) +
+                    WindowInsets.navigationBars.asPaddingValues(),
+            ) {
+                if (t == 0) syncContent(syncUi, showManual, actions) else usageContent(usageUi, usage)
+            }
         }
     }
+
+    renaming?.let { net ->
+        RenameDialog(net) { label ->
+            if (label != null) vm.rename(net.id, label)
+            renaming = null
+        }
+    }
+}
+
+@Composable
+private operator fun PaddingValues.plus(other: PaddingValues): PaddingValues {
+    val dir = LocalLayoutDirection.current
+    return PaddingValues(
+        start = calculateStartPadding(dir) + other.calculateStartPadding(dir),
+        top = calculateTopPadding() + other.calculateTopPadding(),
+        end = calculateEndPadding(dir) + other.calculateEndPadding(dir),
+        bottom = calculateBottomPadding() + other.calculateBottomPadding(),
+    )
 }

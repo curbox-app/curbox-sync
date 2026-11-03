@@ -68,6 +68,10 @@ object UsageMath {
         )
     }
 
+    /** Phone and browser totals for one day, without building its rows. */
+    fun totals(snapshot: UsageSnapshot, date: String): Pair<Long, Long> =
+        (snapshot.phone[date]?.screenMs ?: 0L) to snapshot.browsers.sumOf { it.days[date]?.totalMs ?: 0L }
+
     /** Monday to Sunday of the week [weeksBack] weeks before this one. */
     fun week(weeksBack: Int, today: LocalDate = LocalDate.now()): List<LocalDate> {
         val monday = today.minusDays((today.dayOfWeek.value - 1).toLong()).minusWeeks(weeksBack.toLong())
