@@ -33,6 +33,8 @@ data class SyncStatus(
     val lastBrowserAt: Long = 0,
     val lastEvent: String = "",
     val error: String? = null,
+    val network: CurrentNetwork? = null,
+    val networks: List<SavedNetwork> = emptyList(),
 )
 
 /**
@@ -44,6 +46,7 @@ object SyncRuntime {
     private const val TAG = "SyncRuntime"
     private const val CLOCK_WINDOW_MS = 10 * 60_000L
     private const val MAX_WAIT_MS = 25_000L
+    private const val USAGE_EVERY_MS = 5 * 60_000L
 
     private val _status = MutableStateFlow(SyncStatus())
     val status: StateFlow<SyncStatus> = _status
@@ -57,6 +60,62 @@ object SyncRuntime {
     private var pollJob: Job? = null
     @Volatile private var pairing: Pairing? = null
     private val seenIds = LinkedHashMap<String, Long>()
+    @Volatile private var usageStore: UsageStore? = null
+    @Volatile private var networks: Networks? = null
+    @Volatile private var usageReadAt = 0L
+
+    /** Combined usage is shown even while sync is off, so the store lives apart from the server. */
+    @Synchronized
+    fun usage(appContext: Context): UsageStore =
+        usageStore ?: UsageStore(appContext.applicationContext).also { usageStore = it }
+
+    private fun networks(ctx: Context): Networks = networks ?: Networks(ctx).also { networks = it }
+
+    /** Shows saved networks before sync has started. */
+    fun loadNetworks(appContext: Context) {
+        val ctx = appContext.applicationContext
+        CoroutineScope(Dispatchers.IO).launch {
+            val n = networks(ctx)
+            update { it.copy(networks = n.all(), network = Networks.current(ctx)) }
+        }
+    }
+
+    fun renameNetwork(appContext: Context, id: String, label: String) {
+        val ctx = appContext.applicationContext
+        CoroutineScope(Dispatchers.IO).launch { update { it.copy(networks = networks(ctx).rename(id, label)) } }
+    }
+
+    fun forgetNetwork(appContext: Context, id: String) {
+        val ctx = appContext.applicationContext
+        CoroutineScope(Dispatchers.IO).launch { update { it.copy(networks = networks(ctx).forget(id)) } }
+    }
+
+    /** Re-reads this phone's history from Curbox. */
+    fun refreshUsage() {
+        usageReadAt = 0L
+        scope?.launch(Dispatchers.IO) { readPhoneUsage() }
+    }
+
+    private fun readPhoneUsage() {
+        val ctx = context ?: return
+        val api = connection?.api ?: return
+        val phone = bridge?.state?.value ?: return
+        if (phone.access != CurboxAccess.READY) return
+        val now = System.currentTimeMillis()
+        if (now - usageReadAt < USAGE_EVERY_MS) return
+        usageReadAt = now
+        runCatching {
+            if (phone.apiVersion >= 5) {
+                val raw = api.list("USAGE_HISTORY") ?: return
+                usage(ctx).setPhone(UsageStore.parsePhoneHistory(raw), detailed = true)
+            } else {
+                val raw = api.query("SCREENTIME_TODAY") ?: return
+                val minutes = JSONObject(raw).optString("screentime").toLongOrNull() ?: return
+                val today = java.time.LocalDate.now().toString()
+                usage(ctx).setPhone(listOf(PhoneDay(today, minutes * 60_000L, emptyList(), emptyList())), detailed = false)
+            }
+        }.onFailure { Log.w(TAG, "Could not read usage", it) }
+    }
 
     @Synchronized
     fun start(appContext: Context) {
@@ -87,12 +146,14 @@ object SyncRuntime {
         pollJob = s.launch(Dispatchers.IO) {
             while (isActive) {
                 b.refresh()
-                update { it.copy(addresses = wifiAddresses()) }
+                readPhoneUsage()
+                update { it.copy(addresses = wifiAddresses(), network = Networks.current(ctx)) }
                 val browserRecent = System.currentTimeMillis() - _status.value.lastBrowserAt < 120_000L
                 delay(if (browserRecent) 2_000L else 15_000L)
             }
         }
         acquireWifiLock(ctx)
+        loadNetworks(ctx)
     }
 
     @Synchronized
@@ -116,6 +177,7 @@ object SyncRuntime {
         scope?.launch {
             selectInstall(ctx)
             pollNow()
+            refreshUsage()
         }
     }
 
@@ -131,7 +193,7 @@ object SyncRuntime {
             val p = withContext(Dispatchers.IO) { Prefs(ctx).resetPairing() }
             pairing = p
             publishPairing(p)
-            update { it.copy(lastEvent = "New pairing code made") }
+            update { it.copy(lastEvent = "All browsers unpaired. Scan a new code to pair again.") }
         }
     }
 
@@ -199,6 +261,12 @@ object SyncRuntime {
         if (id.isEmpty() || id.length > 64 || abs(now - req.optLong("ts")) > CLOCK_WINDOW_MS) return null
         if (!rememberId(id, now)) return null
         update { it.copy(lastBrowserAt = now) }
+        val ctx = context
+        val net = ctx?.let { withContext(Dispatchers.IO) { Networks.current(it) } }
+        if (ctx != null && net != null) {
+            val saved = withContext(Dispatchers.IO) { networks(ctx).touch(net, now) }
+            update { it.copy(network = net, networks = saved) }
+        }
 
         val reply = JSONObject().put("ok", true)
         when (req.optString("op")) {
@@ -215,7 +283,22 @@ object SyncRuntime {
                 val what = if (desired.active) "start ${desired.name}" else "stop focus"
                 update { it.copy(lastEvent = "Browser asked to $what: $result") }
             }
+            "usage" -> {
+                val store = ctx?.let { usage(it) }
+                val client = req.optJSONObject("client") ?: JSONObject()
+                val clientId = client.optString("id").take(64)
+                if (store == null || clientId.isEmpty()) {
+                    reply.put("ok", false).put("error", "bad_client")
+                } else {
+                    val days = UsageStore.parseBrowserDays(req.optJSONArray("days"))
+                    val known = withContext(Dispatchers.IO) { store.putBrowser(clientId, client.optString("name").take(60), days) }
+                    reply.put("known", JSONObject().apply { known.forEach { (d, ms) -> put(d, ms) } })
+                }
+            }
             else -> reply.put("ok", false).put("error", "unknown_op")
+        }
+        if (ctx != null && net != null) {
+            reply.put("net", JSONObject().put("id", net.id).put("label", networks(ctx).labelFor(net)).put("address", net.address))
         }
         reply.put("phone", b.state.value.toJson()).put("now", System.currentTimeMillis())
         return LanCrypto.seal(key, LanCrypto.responseAad(id), reply.toString())

@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * A deliberately tiny HTTP/1.1 server for the WiFi link. Every request body is sealed with the
  * pairing key, so the transport itself carries no secrets. Only private network peers are served.
  *
- *   GET  /v1/hello  -> {"app":"curbox-sync","proto":1}
+ *   GET  /v1/hello  -> {"app":"curbox-sync","proto":2,...}
  *   POST /v1/rpc    -> sealed request in, sealed response out (401 when it does not open)
  */
 class LanServer(
@@ -84,7 +84,7 @@ class LanServer(
 
         when {
             method == "OPTIONS" -> respond(client, 204, "")
-            method == "GET" && path == "/v1/hello" -> respond(client, 200, """{"app":"curbox-sync","proto":1}""", "application/json")
+            method == "GET" && path == "/v1/hello" -> respond(client, 200, HELLO, "application/json")
             method == "POST" && path == "/v1/rpc" -> {
                 val length = headers["content-length"]?.toIntOrNull() ?: return respond(client, 411, "")
                 if (length !in 1..MAX_BODY) return respond(client, 413, "")
@@ -141,6 +141,8 @@ class LanServer(
 
     companion object {
         const val PORT = 47621
+        /** proto 2 adds the `usage` op and the `net` reply field. */
+        private const val HELLO = """{"app":"curbox-sync","proto":2,"features":["usage","net"]}"""
         private const val TAG = "LanServer"
         private const val MAX_CONNECTIONS = 16
         private const val MAX_HEAD = 8 * 1024
