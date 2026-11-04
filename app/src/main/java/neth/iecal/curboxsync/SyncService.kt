@@ -9,19 +9,22 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 
-/** Keeps the WiFi link open while the screen is off. */
+/**
+ * Keeps sync running while the screen is off, unless Curbox hosts it through [CompanionService].
+ * Then this service stops and its notification goes away.
+ */
 class SyncService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            Prefs(this).enabled = false
-            stopSelf()
+            stop(this)
             return START_NOT_STICKY
         }
         ServiceCompat.startForeground(
@@ -29,11 +32,13 @@ class SyncService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
         )
         SyncRuntime.start(applicationContext)
+        // Curbox may have bound us while this start was on its way.
+        if (hosted) stopSelf()
         return START_STICKY
     }
 
     override fun onDestroy() {
-        SyncRuntime.stop()
+        if (!hosted) SyncRuntime.stop()
         super.onDestroy()
     }
 
@@ -64,16 +69,47 @@ class SyncService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "neth.iecal.curboxsync.STOP"
 
+        private const val TAG = "SyncService"
+
+        /** True while Curbox keeps this process alive, so no foreground service is needed. */
+        @Volatile
+        var hosted = false
+            private set
+
         fun start(context: Context) {
             Prefs(context).enabled = true
-            ContextCompat.startForegroundService(context, Intent(context, SyncService::class.java))
+            if (hosted) SyncRuntime.start(context.applicationContext)
+            else ContextCompat.startForegroundService(context, Intent(context, SyncService::class.java))
         }
 
         fun isRunning() = SyncRuntime.status.value.running
 
         fun stop(context: Context) {
             Prefs(context).enabled = false
+            SyncRuntime.stop(releaseHost = true)
             context.stopService(Intent(context, SyncService::class.java))
+        }
+
+        /** Curbox started or stopped hosting this app. */
+        fun onHosted(context: Context, on: Boolean) {
+            if (on == hosted) return
+            hosted = on
+            SyncRuntime.setHosted(on)
+            if (on) {
+                SyncRuntime.start(context)
+                context.stopService(Intent(context, SyncService::class.java))
+            } else if (Prefs(context).enabled) {
+                // Curbox stopped (for example its accessibility service was turned off). Battery
+                // exemption, which hosting requires, allows this start from the background.
+                try {
+                    ContextCompat.startForegroundService(context, Intent(context, SyncService::class.java))
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not fall back to a foreground service", e)
+                    SyncRuntime.stop()
+                }
+            } else {
+                SyncRuntime.stop()
+            }
         }
     }
 }

@@ -2,8 +2,15 @@ package neth.iecal.curboxsync
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.net.wifi.WifiManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Bundle
+import android.os.PowerManager
 import android.util.Log
+import neth.iecal.curbox.api.ICurboxListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,6 +42,10 @@ data class SyncStatus(
     val error: String? = null,
     val network: CurrentNetwork? = null,
     val networks: List<SavedNetwork> = emptyList(),
+    /** Curbox keeps this app running, so there is no notification. */
+    val hosted: Boolean = false,
+    /** Why Curbox cannot host this app yet, or null. */
+    val hostHint: String? = null,
 )
 
 /**
@@ -46,7 +57,8 @@ object SyncRuntime {
     private const val TAG = "SyncRuntime"
     private const val CLOCK_WINDOW_MS = 10 * 60_000L
     private const val MAX_WAIT_MS = 25_000L
-    private const val USAGE_EVERY_MS = 5 * 60_000L
+    // With Curbox's change callback, reads are only a safety net.
+    private const val PUSHED_POLL_MS = 5 * 60_000L
 
     private val _status = MutableStateFlow(SyncStatus())
     val status: StateFlow<SyncStatus> = _status
@@ -56,13 +68,20 @@ object SyncRuntime {
     private var connection: CurboxConnection? = null
     private var bridge: FocusBridge? = null
     private var server: LanServer? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    /** Curbox calls back on focus changes (API 6), so the fast poll is not needed. */
+    @Volatile private var listening = false
+    @Volatile private var hostAsked = false
     private var pollJob: Job? = null
     @Volatile private var pairing: Pairing? = null
     private val seenIds = LinkedHashMap<String, Long>()
     @Volatile private var usageStore: UsageStore? = null
     @Volatile private var networks: Networks? = null
-    @Volatile private var usageReadAt = 0L
+    @Volatile private var usageRead = false
+
+    private val listener = object : ICurboxListener.Stub() {
+        override fun onChanged(what: String?) = pollNow()
+    }
 
     /** Combined usage is shown even while sync is off, so the store lives apart from the server. */
     @Synchronized
@@ -92,7 +111,6 @@ object SyncRuntime {
 
     /** Re-reads this phone's history from Curbox. */
     fun refreshUsage() {
-        usageReadAt = 0L
         scope?.launch(Dispatchers.IO) { readPhoneUsage() }
     }
 
@@ -101,9 +119,8 @@ object SyncRuntime {
         val api = connection?.api ?: return
         val phone = bridge?.state?.value ?: return
         if (phone.access != CurboxAccess.READY) return
-        val now = System.currentTimeMillis()
-        if (now - usageReadAt < USAGE_EVERY_MS) return
-        usageReadAt = now
+        // Only the screens here show phone usage, so it is read when they open, not in the background.
+        usageRead = true
         runCatching {
             if (phone.apiVersion >= 5) {
                 val raw = api.list("USAGE_HISTORY") ?: return
@@ -144,23 +161,64 @@ object SyncRuntime {
                 update { it.copy(error = "Could not open port ${LanServer.PORT}: ${e.message}") }
             }
         }
-        s.launch { b.state.collect { phone -> update { it.copy(phone = phone) } } }
-        s.launch { conn.connected.collect { pollNow() } }
+        s.launch {
+            b.state.collect { phone ->
+                update { it.copy(phone = phone) }
+                if (phone.access == CurboxAccess.READY) withContext(Dispatchers.IO) { onCurboxReady(ctx, phone) }
+            }
+        }
+        s.launch {
+            conn.connected.collect { up ->
+                if (!up) {
+                    listening = false
+                    hostAsked = false
+                }
+                pollNow()
+            }
+        }
         pollJob = s.launch(Dispatchers.IO) {
             while (isActive) {
                 b.refresh()
-                readPhoneUsage()
-                update { it.copy(addresses = wifiAddresses(), network = Networks.current(ctx)) }
-                val browserRecent = System.currentTimeMillis() - _status.value.lastBrowserAt < 120_000L
-                delay(if (browserRecent) 2_000L else 15_000L)
+                if (!listening) refreshNetwork(ctx)
+                val now = System.currentTimeMillis()
+                val browserRecent = now - _status.value.lastBrowserAt < 120_000L
+                val every = when {
+                    listening -> PUSHED_POLL_MS
+                    browserRecent -> 2_000L
+                    else -> 15_000L
+                }
+                // Reaching the end time is not a change Curbox reports, so wake for it.
+                val phone = b.state.value
+                val untilEnd = if (phone.active) (phone.endsAt - now + 1_500L).coerceAtLeast(1_000L) else Long.MAX_VALUE
+                delay(minOf(every, untilEnd))
             }
         }
-        acquireWifiLock(ctx)
+        watchNetwork(ctx)
         loadNetworks(ctx)
     }
 
+    /**
+     * Stops the engine. [releaseHost] also tells Curbox to stop keeping this app running, which is
+     * what turning sync off means; a hand over between Curbox and the foreground service does not.
+     */
     @Synchronized
-    fun stop() {
+    fun stop(releaseHost: Boolean = false) {
+        val api = connection?.api
+        if (api != null) {
+            // The proxy stays usable after unbinding, so these finish on their own.
+            Thread {
+                runCatching { if (listening) api.removeListener(listener) }
+                if (releaseHost && _status.value.phone.apiVersion >= 6) {
+                    runCatching { api.execute("HOST_COMPANION", Bundle().apply { putBoolean("enable", false) }) }
+                }
+            }.start()
+        }
+        listening = false
+        hostAsked = false
+        context?.let { ctx ->
+            netCallback?.let { cb -> runCatching { ctx.getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } }
+        }
+        netCallback = null
         server?.stop()
         server = null
         connection?.disconnect()
@@ -169,9 +227,60 @@ object SyncRuntime {
         scope?.cancel()
         scope = null
         pollJob = null
-        runCatching { wifiLock?.release() }
-        wifiLock = null
         update { it.copy(running = false) }
+    }
+
+    fun setHosted(on: Boolean) = update { it.copy(hosted = on, hostHint = if (on) null else it.hostHint) }
+
+    /** Subscribes to Curbox's changes and asks it to host this app, once per connection. */
+    private fun onCurboxReady(ctx: Context, phone: PhoneFocus) {
+        val api = connection?.api ?: return
+        if (!usageRead) readPhoneUsage()
+        if (phone.apiVersion < 6) {
+            update { it.copy(hostHint = "Update Curbox to run without a notification") }
+            return
+        }
+        if (!listening) {
+            listening = runCatching { api.addListener(listener) }.isSuccess
+        }
+        if (hostAsked || SyncService.hosted) return
+        val power = ctx.getSystemService(PowerManager::class.java)
+        if (power?.isIgnoringBatteryOptimizations(ctx.packageName) != true) {
+            // Without it the hosted process loses WiFi in Doze and cannot fall back on its own.
+            update { it.copy(hostHint = "Allow background use so Curbox can run sync without a notification") }
+            return
+        }
+        hostAsked = true
+        val result = runCatching { api.execute("HOST_COMPANION", Bundle().apply { putBoolean("enable", true) }) }.getOrNull()
+        update {
+            it.copy(hostHint = if (result == "OK" && !it.hosted) "Turn on Curbox's accessibility service to run without a notification" else null)
+        }
+    }
+
+    private fun refreshNetwork(ctx: Context) {
+        update { it.copy(addresses = wifiAddresses(), network = Networks.current(ctx)) }
+    }
+
+    /** Network changes arrive as callbacks instead of being polled. */
+    private fun watchNetwork(ctx: Context) {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = changed()
+            override fun onLost(network: Network) = changed()
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = changed()
+            private fun changed() {
+                scope?.launch(Dispatchers.IO) { refreshNetwork(ctx) }
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        runCatching {
+            cm.registerNetworkCallback(request, cb)
+            netCallback = cb
+        }.onFailure { Log.w(TAG, "Could not watch the network", it) }
     }
 
     /** Re-discovers installations and re-reads access, for example after the approval screen closes. */
@@ -179,8 +288,14 @@ object SyncRuntime {
         val ctx = context ?: return
         scope?.launch {
             selectInstall(ctx)
-            pollNow()
-            refreshUsage()
+            // Back from the battery screen, for example; ask Curbox again.
+            hostAsked = false
+            withContext(Dispatchers.IO) {
+                val phone = bridge?.refresh()
+                if (phone?.access == CurboxAccess.READY) onCurboxReady(ctx, phone)
+                readPhoneUsage()
+                refreshNetwork(ctx)
+            }
         }
     }
 
@@ -327,14 +442,4 @@ object SyncRuntime {
             .map { "${it.hostAddress}:${LanServer.PORT}" }
             .distinct()
     }.getOrDefault(emptyList())
-
-    @Suppress("DEPRECATION")
-    private fun acquireWifiLock(ctx: Context) {
-        val wifi = ctx.getSystemService(WifiManager::class.java) ?: return
-        val mode = if (android.os.Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        else WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        wifiLock = runCatching {
-            wifi.createWifiLock(mode, "curboxsync:lan").apply { setReferenceCounted(false); acquire() }
-        }.getOrNull()
-    }
 }

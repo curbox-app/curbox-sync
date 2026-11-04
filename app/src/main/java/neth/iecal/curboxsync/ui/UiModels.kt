@@ -31,6 +31,8 @@ data class SyncUi(
     val code: String = "",
     val canUnpair: Boolean = false,
     val lastEvent: String = "",
+    val runSub: String = "Runs quietly while the screen is off",
+    val batterySub: String = "Let Curbox Sync run in the background",
 )
 
 @Immutable

@@ -74,6 +74,13 @@ worker is awake.
 Curbox Sync works with API 3, but API 4 (added for this) gives exact sync: `FOCUS_ACTIVE` adds
 `focus_group_id` and `focus_ends_at`, and `START_FOCUS` takes an optional `ends_at`.
 
+API 6 lets the phone side run lighter. Curbox Sync registers a change listener, so it reads Curbox
+when focus changes (plus once at the session end and every 5 min as a safety net) instead of every
+2 to 15 s. If the app is excluded from battery optimization it also calls `HOST_COMPANION`: Curbox's
+blocker service binds `CompanionService`, which keeps the process alive, and the foreground service
+and its notification stop. If Curbox unbinds, the foreground service starts again. On older Curbox
+versions, nothing changes.
+
 ## Several networks
 
 The phone keeps each network a browser synced on (`networks.json`, up to 12) and the user can name

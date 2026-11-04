@@ -152,6 +152,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 code = s.code,
                 canUnpair = s.browsers > 0,
                 lastEvent = s.lastEvent,
+                runSub = when {
+                    !s.running -> "Off"
+                    s.hosted -> "Curbox keeps it running, so there is no notification"
+                    else -> "Runs quietly while the screen is off"
+                },
+                batterySub = s.hostHint ?: "Let Curbox Sync run in the background",
             )
         }
 

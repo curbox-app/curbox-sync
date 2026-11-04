@@ -6,7 +6,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- connectedDevice foreground services need one of these on Android 14+. -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -69,6 +68,16 @@
             android:name=".SyncService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Curbox binds this to keep sync running without a notification (Curbox API 6). -->
+        <service
+            android:name=".CompanionService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="neth.iecal.curbox.api.COMPANION" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".BootReceiver"

@@ -121,13 +121,13 @@ fun LazyListScope.syncContent(ui: SyncUi, showManual: Boolean, actions: SyncActi
     item(key = "s-toggle", contentType = "row") {
         ListRow(
             title = "Sync over WiFi",
-            subtitle = "Runs quietly while the screen is off",
+            subtitle = ui.runSub,
             onClick = { actions.onToggle(!ui.running) },
             trailing = { Switch(checked = ui.running, onCheckedChange = actions.onToggle) },
         )
     }
     item(key = "s-battery", contentType = "row") {
-        ListRow(title = "Battery", subtitle = "Let Curbox Sync run in the background", onClick = actions.onBattery)
+        ListRow(title = "Battery", subtitle = ui.batterySub, onClick = actions.onBattery)
     }
     if (ui.canUnpair) {
         item(key = "s-unpair", contentType = "row") {
