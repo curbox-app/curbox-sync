@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Holds a WiFi lock so power saving does not hide this phone from the browser. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- connectedDevice foreground services need one of these on Android 14+. -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -21,6 +23,8 @@
         <intent>
             <action android:name="neth.iecal.curbox.api.REQUEST_PERMISSION" />
         </intent>
+        <!-- Shows whether Tailscale is installed, and turns it on with one tap. -->
+        <package android:name="com.tailscale.ipn" />
     </queries>
 
     <application
@@ -45,24 +49,7 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- The QR code the browser shows; a camera app can open it straight here. -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-
-                <data android:scheme="curboxsync" android:host="pair" />
-            </intent-filter>
         </activity>
-
-        <activity
-            android:name=".PortraitCaptureActivity"
-            android:exported="false"
-            android:screenOrientation="portrait"
-            android:stateNotNeeded="true"
-            android:theme="@style/zxing_CaptureTheme"
-            android:windowSoftInputMode="stateAlwaysHidden" />
 
         <service
             android:name=".SyncService"

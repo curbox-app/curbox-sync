@@ -35,6 +35,9 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import neth.iecal.curboxsync.ui.theme.PeerColorsDark
+import neth.iecal.curboxsync.ui.theme.PeerColorsLight
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -178,15 +181,34 @@ fun Tabs(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier
 
 /** Weekly bars split into phone and browser time, like Curbox's WeeklyBarGraphView. Heights ease between weeks. */
 @Composable
+fun seriesColor(slot: Int): Color {
+    val scheme = MaterialTheme.colorScheme
+    val dark = scheme.background.luminance() < 0.5f
+    return when (slot) {
+        Series.OWN -> scheme.primary
+        Series.BROWSER -> scheme.primary.copy(alpha = 0.38f)
+        else -> (if (dark) PeerColorsDark else PeerColorsLight)[(slot - 1).coerceIn(0, Series.PEERS - 1)]
+    }
+}
+
+@Composable
 fun WeekBars(bars: List<Bar>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
-    val phoneColor = MaterialTheme.colorScheme.primary
-    val browserColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.38f)
+    val colors = List(Series.SLOTS) { seriesColor(it) }
     val emptyColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-    val max = (bars.maxOfOrNull { it.phone + it.browser } ?: 0L).coerceAtLeast(1L).toFloat()
+    val max = (bars.maxOfOrNull { it.values.sum() } ?: 0L).coerceAtLeast(1L).toFloat()
     val spec = spring<Float>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
     // Seven fixed slots, so the animations line up with bars across weeks.
-    val totals = List(7) { i -> animateFloatAsState(bars.getOrNull(i)?.let { (it.phone + it.browser) / max } ?: 0f, spec, label = "bar") }
-    val phones = List(7) { i -> animateFloatAsState(bars.getOrNull(i)?.let { b -> if (b.phone + b.browser == 0L) 0f else b.phone.toFloat() / (b.phone + b.browser) } ?: 0f, spec, label = "split") }
+    val totals = List(7) { i -> animateFloatAsState(bars.getOrNull(i)?.let { it.values.sum() / max } ?: 0f, spec, label = "bar") }
+    // Per day, the share of the bar up to and including each source, bottom to top.
+    val shares = List(7) { i ->
+        val v = bars.getOrNull(i)?.values
+        val sum = v?.sum() ?: 0L
+        var acc = 0L
+        List(Series.SLOTS) { k ->
+            acc += v?.getOrNull(k) ?: 0L
+            animateFloatAsState(if (sum == 0L) 0f else acc.toFloat() / sum, spec, label = "split")
+        }
+    }
     val pick = animateFloatAsState(selected.toFloat(), spec, label = "pick")
     val count = bars.size.coerceAtLeast(1)
     Column(modifier.fillMaxWidth()) {
@@ -208,9 +230,13 @@ fun WeekBars(bars: List<Bar>, selected: Int, onSelect: (Int) -> Unit, modifier: 
                     drawRoundRect(emptyColor, Offset(x, size.height - minH), Size(w, minH), r)
                     continue
                 }
-                drawRoundRect(browserColor.copy(alpha = browserColor.alpha * alpha), Offset(x, size.height - h), Size(w, h), r)
-                val ph = h * phones[i].value
-                if (ph > 0.5f) drawRoundRect(phoneColor.copy(alpha = alpha), Offset(x, size.height - ph), Size(w, ph), r)
+                // Top source first, each lower one drawn over it up to its own share.
+                for (k in Series.SLOTS - 1 downTo 0) {
+                    val below = if (k == 0) 0f else shares[i][k - 1].value
+                    if (shares[i][k].value - below <= 0.001f) continue
+                    val sh = h * shares[i][k].value
+                    if (sh > 0.5f) drawRoundRect(colors[k].copy(alpha = colors[k].alpha * alpha), Offset(x, size.height - sh), Size(w, sh), r)
+                }
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {

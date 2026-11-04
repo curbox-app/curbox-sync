@@ -6,7 +6,6 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -39,6 +38,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -46,10 +47,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 import neth.iecal.curboxsync.ui.Gutter
 import neth.iecal.curboxsync.ui.NetUi
+import neth.iecal.curboxsync.ui.PhoneCodeDialog
 import neth.iecal.curboxsync.ui.RenameDialog
 import neth.iecal.curboxsync.ui.SyncActions
 import neth.iecal.curboxsync.ui.Tabs
@@ -64,12 +64,6 @@ class MainActivity : ComponentActivity() {
         SyncRuntime.recheck()
     }
 
-    private val scanner = registerForActivityResult(ScanContract()) { result ->
-        val text = result.contents ?: return@registerForActivityResult
-        if (!SyncService.isRunning()) SyncService.start(this)
-        if (!SyncRuntime.pairFromLink(this, text)) toast("That is not a Curbox pairing code.")
-    }
-
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     private val vm: MainViewModel by viewModels()
@@ -81,10 +75,10 @@ class MainActivity : ComponentActivity() {
             onChoose = vm::choose,
             onUnpairAll = vm::unpairAll,
             onBattery = ::openBatterySettings,
-            onScan = ::scanBrowserCode,
             onRename = {},
             onForget = vm::forget,
-            onToggleManual = {},
+            onForgetPhone = vm::forgetPhone,
+            onTailscale = vm::tailscale,
         )
     }
 
@@ -95,7 +89,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         if (Prefs(this).enabled) SyncService.start(this)
         if (Build.VERSION.SDK_INT >= 33) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
-        handlePairingLink(intent)
         SyncRuntime.loadNetworks(this)
         setContent {
             CurboxSyncTheme {
@@ -104,14 +97,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handlePairingLink(intent)
-    }
-
     override fun onResume() {
         super.onResume()
+        SyncRuntime.pairingOpen = true
         SyncRuntime.recheck()
+    }
+
+    override fun onPause() {
+        SyncRuntime.pairingOpen = false
+        super.onPause()
     }
 
     private fun requestApproval() {
@@ -123,27 +117,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun scanBrowserCode() {
-        scanner.launch(
-            ScanOptions()
-                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                .setPrompt("Point at the code in the Curbox extension")
-                .setBeepEnabled(false)
-                .setOrientationLocked(true)
-                .setCaptureActivity(PortraitCaptureActivity::class.java)
-        )
-    }
-
-    private fun handlePairingLink(intent: Intent?) {
-        val link = intent?.data?.toString() ?: return
-        if (intent.action != Intent.ACTION_VIEW) return
-        intent.data = null
-        if (!Prefs(this).enabled) SyncService.start(this)
-        if (!SyncRuntime.pairFromLink(this, link)) toast("That is not a Curbox pairing code.")
-    }
-
-    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
-
     private fun openBatterySettings() {
         runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
     }
@@ -154,15 +127,24 @@ private fun Home(vm: MainViewModel, sync: SyncActions, usage: UsageActions) {
     val syncUi by vm.sync.collectAsStateWithLifecycle()
     val usageUi by vm.usage.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableIntStateOf(0) }
-    var showManual by rememberSaveable { mutableStateOf(false) }
+    var showPair by rememberSaveable { mutableStateOf(false) }
+    var showMore by rememberSaveable { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<NetUi?>(null) }
+    var addingPhone by rememberSaveable { mutableStateOf(false) }
+    var pairingPhone by remember { mutableStateOf(false) }
+    var phoneNote by remember { mutableStateOf<String?>(null) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
     val syncList = rememberLazyListState()
     val usageList = rememberLazyListState()
     val actions = remember(sync) {
         SyncActions(
             onToggle = sync.onToggle, onApprove = sync.onApprove, onChoose = sync.onChoose,
-            onUnpairAll = sync.onUnpairAll, onBattery = sync.onBattery, onScan = sync.onScan,
-            onRename = { renaming = it }, onForget = sync.onForget, onToggleManual = { showManual = !showManual },
+            onUnpairAll = sync.onUnpairAll, onBattery = sync.onBattery,
+            onRename = { renaming = it }, onForget = sync.onForget,
+            onAddPhone = { phoneNote = null; addingPhone = true }, onForgetPhone = sync.onForgetPhone,
+            onTailscale = sync.onTailscale,
+            onTogglePair = { showPair = !showPair }, onToggleMore = { showMore = !showMore },
         )
     }
 
@@ -186,7 +168,22 @@ private fun Home(vm: MainViewModel, sync: SyncActions, usage: UsageActions) {
                 contentPadding = PaddingValues(start = Gutter, end = Gutter, bottom = 32.dp) +
                     WindowInsets.navigationBars.asPaddingValues(),
             ) {
-                if (t == 0) syncContent(syncUi, showManual, actions) else usageContent(usageUi, usage)
+                if (t == 0) syncContent(syncUi, actions, showPair, showMore) else usageContent(usageUi, usage)
+            }
+        }
+    }
+
+    if (addingPhone) {
+        PhoneCodeDialog(pairingPhone, phoneNote) { code ->
+            if (code == null) {
+                addingPhone = false
+                return@PhoneCodeDialog
+            }
+            pairingPhone = true
+            scope.launch {
+                val note = SyncRuntime.pairWithPhone(context, code)
+                pairingPhone = false
+                if (note.startsWith("Paired")) addingPhone = false else phoneNote = note
             }
         }
     }

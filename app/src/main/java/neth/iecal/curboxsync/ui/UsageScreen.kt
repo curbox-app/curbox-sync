@@ -5,6 +5,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -32,7 +34,7 @@ fun LazyListScope.usageContent(ui: UsageUi, actions: UsageActions) {
             Hero(label = label, big = if (ui.loaded) total else " ")
         }
     }
-    item(key = "u-split", contentType = "split") { Split(ui.phone, ui.browser) }
+    item(key = "u-split", contentType = "split") { Legend(ui.series) }
     item(key = "u-bars", contentType = "bars") {
         WeekBars(ui.bars, ui.selected, actions.onSelectDay, Modifier.padding(top = 32.dp))
     }
@@ -59,26 +61,30 @@ fun LazyListScope.usageContent(ui: UsageUi, actions: UsageActions) {
     }
     item(key = "u-sources-label", contentType = "label") { SectionLabel("Sources") }
     items(ui.sources, key = { it.key }, contentType = { "source" }) { s ->
-        val color = MaterialTheme.colorScheme.primary
         ListRow(
             title = s.title,
             subtitle = s.subtitle,
-            leading = { Dot(if (s.phone) color else color.copy(alpha = 0.38f), 10) },
+            leading = { Dot(seriesColor(s.slot), 10) },
         )
     }
 }
 
+/** One dot, name and time per source, in the bar colors. Wraps when there are many phones. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun Split(phone: String, browser: String) {
-    val color = MaterialTheme.colorScheme.primary
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-        Dot(color)
-        Spacer(Modifier.width(6.dp))
-        Text(phone, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.width(20.dp))
-        Dot(color.copy(alpha = 0.38f))
-        Spacer(Modifier.width(6.dp))
-        Text(browser, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun Legend(series: List<SeriesUi>) {
+    FlowRow(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        series.forEach { s ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Dot(seriesColor(s.slot))
+                Spacer(Modifier.width(6.dp))
+                Text("${s.label} ${s.time}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 

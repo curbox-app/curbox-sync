@@ -11,7 +11,17 @@ data class PhoneDay(val date: String, val screenMs: Long, val apps: List<AppTime
 /** One day as a browser recorded it. */
 data class BrowserDay(val date: String, val totalMs: Long, val sites: List<SiteTime>)
 
-data class BrowserUsage(val id: String, val name: String, val lastSeen: Long, val days: Map<String, BrowserDay>)
+data class BrowserUsage(
+    val id: String,
+    val name: String,
+    val lastSeen: Long,
+    val days: Map<String, BrowserDay>,
+    /** The paired phone this browser's days came through, or null when it sent them here itself. */
+    val via: String? = null,
+)
+
+/** What another paired phone's Curbox recorded, as that phone sent it. */
+data class PeerPhoneUsage(val id: String, val name: String, val lastSeen: Long, val days: Map<String, PhoneDay>)
 
 data class UsageSnapshot(
     val phone: Map<String, PhoneDay> = emptyMap(),
@@ -19,6 +29,8 @@ data class UsageSnapshot(
     val phoneDetailed: Boolean = true,
     val phoneReadAt: Long = 0,
     val browsers: List<BrowserUsage> = emptyList(),
+    /** Other phones paired with this one. */
+    val phones: List<PeerPhoneUsage> = emptyList(),
 )
 
 enum class Source { PHONE, BROWSER, BOTH }
@@ -38,11 +50,17 @@ object UsageMath {
     const val RETAIN_DAYS = 28
 
     fun combine(snapshot: UsageSnapshot, date: String): CombinedDay {
-        val phone = snapshot.phone[date]
+        val phoneDays = listOfNotNull(snapshot.phone[date]) + snapshot.phones.mapNotNull { it.days[date] }
         val browserDays = snapshot.browsers.mapNotNull { it.days[date] }
-        val apps = phone?.apps.orEmpty().map { UsageRow("app:${it.packageName}", it.label.ifBlank { it.packageName }, true, it.ms, Source.PHONE) }
+        // The same app on two phones is one row.
+        val appTimes = LinkedHashMap<String, Pair<String, Long>>()
+        phoneDays.flatMap { it.apps }.forEach { a ->
+            val (label, ms) = appTimes[a.packageName] ?: (a.label to 0L)
+            appTimes[a.packageName] = label.ifBlank { a.label } to (ms + a.ms)
+        }
+        val apps = appTimes.map { (pkg, t) -> UsageRow("app:$pkg", t.first.ifBlank { pkg }, true, t.second, Source.PHONE) }
         val sites = LinkedHashMap<String, Pair<Long, Long>>()
-        phone?.sites.orEmpty().forEach { s ->
+        phoneDays.flatMap { it.sites }.forEach { s ->
             val d = cleanDomain(s.domain)
             val (p, b) = sites[d] ?: (0L to 0L)
             sites[d] = (p + s.ms) to b
@@ -62,15 +80,28 @@ object UsageMath {
         }
         return CombinedDay(
             date = date,
-            phoneMs = phone?.screenMs ?: 0L,
+            phoneMs = phoneDays.sumOf { it.screenMs },
             browserMs = browserDays.sumOf { it.totalMs },
             rows = (apps + siteRows).filter { it.ms > 0 }.sortedByDescending { it.ms },
         )
     }
 
+    /** Other phones in a fixed order, so each keeps its color from day to day. */
+    fun peerOrder(snapshot: UsageSnapshot): List<PeerPhoneUsage> = snapshot.phones.sortedBy { it.id }
+
+    /**
+     * One day's time per source: this phone, then each other phone in [peerOrder], then all
+     * browsers together.
+     */
+    fun bySource(snapshot: UsageSnapshot, date: String): List<Long> =
+        listOf(snapshot.phone[date]?.screenMs ?: 0L) +
+            peerOrder(snapshot).map { it.days[date]?.screenMs ?: 0L } +
+            snapshot.browsers.sumOf { it.days[date]?.totalMs ?: 0L }
+
     /** Phone and browser totals for one day, without building its rows. */
     fun totals(snapshot: UsageSnapshot, date: String): Pair<Long, Long> =
-        (snapshot.phone[date]?.screenMs ?: 0L) to snapshot.browsers.sumOf { it.days[date]?.totalMs ?: 0L }
+        ((snapshot.phone[date]?.screenMs ?: 0L) + snapshot.phones.sumOf { it.days[date]?.screenMs ?: 0L }) to
+            snapshot.browsers.sumOf { it.days[date]?.totalMs ?: 0L }
 
     /** Monday to Sunday of the week [weeksBack] weeks before this one. */
     fun week(weeksBack: Int, today: LocalDate = LocalDate.now()): List<LocalDate> {
@@ -78,7 +109,7 @@ object UsageMath {
         return (0..6).map { monday.plusDays(it.toLong()) }
     }
 
-    fun prune(days: Map<String, BrowserDay>, today: LocalDate = LocalDate.now()): Map<String, BrowserDay> {
+    fun <T> prune(days: Map<String, T>, today: LocalDate = LocalDate.now()): Map<String, T> {
         val cutoff = today.minusDays(RETAIN_DAYS.toLong()).toString()
         return days.filterKeys { it > cutoff }
     }

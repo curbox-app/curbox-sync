@@ -33,7 +33,7 @@ class UsageStore(context: Context) {
         val cur = _snapshot.value
         val old = cur.browsers.firstOrNull { it.id == id }
         val merged = UsageMath.prune((old?.days.orEmpty()) + days.associateBy { it.date })
-        val updated = BrowserUsage(id, name.ifBlank { old?.name ?: "Browser" }, System.currentTimeMillis(), merged)
+        val updated = BrowserUsage(id, name.ifBlank { old?.name ?: "Browser" }, System.currentTimeMillis(), merged, via = null)
         val browsers = (listOf(updated) + cur.browsers.filter { it.id != id }).take(MAX_BROWSERS)
         if (days.isNotEmpty() || old == null || old.name != updated.name) save(cur.copy(browsers = browsers))
         else _snapshot.value = cur.copy(browsers = browsers)
@@ -42,6 +42,57 @@ class UsageStore(context: Context) {
 
     @Synchronized
     fun forgetBrowsers() = save(_snapshot.value.copy(browsers = emptyList()))
+
+    /** Stores the days another phone sent, replacing what it sent before for those dates. */
+    @Synchronized
+    fun putPhone(id: String, name: String, days: List<PhoneDay>) {
+        val cur = _snapshot.value
+        val old = cur.phones.firstOrNull { it.id == id }
+        val merged = UsageMath.prune(old?.days.orEmpty() + days.associateBy { it.date })
+        val updated = PeerPhoneUsage(id, name.ifBlank { old?.name ?: "Phone" }, System.currentTimeMillis(), merged)
+        save(cur.copy(phones = (listOf(updated) + cur.phones.filter { it.id != id }).take(MAX_BROWSERS)))
+    }
+
+    @Synchronized
+    fun forgetPhone(id: String) {
+        val cur = _snapshot.value
+        if (cur.phones.any { it.id == id } || cur.browsers.any { it.via == id }) {
+            save(cur.copy(phones = cur.phones.filter { it.id != id }, browsers = cur.browsers.filter { it.via != id }))
+        }
+    }
+
+    /**
+     * Browser days another phone received. A day keeps the larger total, since a day's total only
+     * grows and whichever phone heard from the browser last knows more.
+     */
+    @Synchronized
+    fun putRelayedBrowsers(peerId: String, list: List<BrowserUsage>) {
+        if (list.isEmpty()) return
+        val cur = _snapshot.value
+        var browsers = cur.browsers
+        for (b in list) {
+            val old = browsers.firstOrNull { it.id == b.id }
+            val days = (old?.days.orEmpty().keys + b.days.keys).associateWith { d ->
+                listOfNotNull(old?.days?.get(d), b.days[d]).maxBy { it.totalMs }
+            }
+            val updated = BrowserUsage(
+                b.id, old?.name?.ifBlank { null } ?: b.name.ifBlank { "Browser" },
+                maxOf(old?.lastSeen ?: 0L, b.lastSeen), UsageMath.prune(days),
+                via = if (old != null && old.via == null) null else peerId,
+            )
+            browsers = listOf(updated) + browsers.filter { it.id != b.id }
+        }
+        save(cur.copy(browsers = browsers.take(MAX_BROWSERS)))
+    }
+
+    /** Browsers that sent their days to this phone itself, to pass on to paired phones. */
+    fun ownBrowsersJson(): JSONArray = JSONArray().apply {
+        _snapshot.value.browsers.filter { it.via == null }.forEach { put(browserJson(it)) }
+    }
+
+    /** This phone's own recent days, as sent to other phones. */
+    fun ownDaysJson(limit: Int = SHARE_DAYS): JSONArray =
+        phoneDaysJson(_snapshot.value.phone.values.sortedByDescending { it.date }.take(limit))
 
     private fun save(s: UsageSnapshot) {
         _snapshot.value = s
@@ -58,6 +109,9 @@ class UsageStore(context: Context) {
         private const val TAG = "UsageStore"
         private const val MAX_BROWSERS = 8
         const val MAX_SITES = 40
+        /** Days a phone shares with another phone each time. */
+        const val SHARE_DAYS = 14
+        private const val MAX_APPS = 60
         private const val DAY_MS = 86_400_000L
 
         fun sitesJson(sites: List<SiteTime>) = JSONArray().apply {
@@ -102,31 +156,64 @@ class UsageStore(context: Context) {
             }.take(limit)
         }
 
+        private fun browserJson(b: BrowserUsage) = JSONObject().put("id", b.id).put("name", b.name).put("lastSeen", b.lastSeen)
+            .put("days", JSONArray().apply {
+                b.days.values.forEach { d ->
+                    put(JSONObject().put("date", d.date).put("totalMs", d.totalMs).put("sites", sitesJson(d.sites)))
+                }
+            })
+
+        /** Browsers another phone passed on. */
+        fun parseBrowsers(arr: JSONArray?): List<BrowserUsage> = (0 until (arr?.length() ?: 0)).mapNotNull {
+            val b = arr!!.optJSONObject(it) ?: return@mapNotNull null
+            val id = b.optString("id").take(64).ifEmpty { return@mapNotNull null }
+            BrowserUsage(id, b.optString("name").take(60), b.optLong("lastSeen"),
+                UsageMath.prune(parseBrowserDays(b.optJSONArray("days"), UsageMath.RETAIN_DAYS).associateBy { d -> d.date }))
+        }.take(MAX_BROWSERS)
+
+        /** Days in Curbox's `USAGE_HISTORY` shape, so [parsePhoneHistory] reads them back. */
+        fun phoneDaysJson(days: Collection<PhoneDay>) = JSONArray().apply {
+            days.forEach { d ->
+                put(JSONObject().put("date", d.date).put("screenTimeMs", d.screenMs)
+                    .put("apps", JSONArray().apply {
+                        d.apps.forEach { a ->
+                            put(JSONObject().put("packageName", a.packageName).put("label", a.label)
+                                .put("ms", a.ms).put("launches", a.launches))
+                        }
+                    })
+                    .put("websites", sitesJson(d.sites)))
+            }
+        }
+
+        /** Days another phone sent. Bad or future days are dropped and each day is capped. */
+        fun parsePeerDays(arr: JSONArray?): List<PhoneDay> {
+            val tomorrow = LocalDate.now().plusDays(1).toString()
+            return runCatching { parsePhoneHistory(arr?.toString() ?: "[]") }.getOrDefault(emptyList())
+                .filter { it.date <= tomorrow }
+                .take(SHARE_DAYS)
+                .map { d ->
+                    d.copy(
+                        screenMs = d.screenMs.coerceIn(0, DAY_MS),
+                        apps = d.apps.filter { it.packageName.isNotBlank() && it.ms > 0 }
+                            .map { it.copy(packageName = it.packageName.take(200), label = it.label.take(80), ms = it.ms.coerceIn(0, DAY_MS)) }
+                            .sortedByDescending { it.ms }.take(MAX_APPS),
+                    )
+                }
+        }
+
         private fun encode(s: UsageSnapshot): JSONObject = JSONObject()
             .put("v", 1)
             .put("phoneDetailed", s.phoneDetailed)
             .put("phoneReadAt", s.phoneReadAt)
-            .put("phone", JSONArray().apply {
-                s.phone.values.forEach { d ->
-                    put(JSONObject().put("date", d.date).put("screenTimeMs", d.screenMs)
-                        .put("apps", JSONArray().apply {
-                            d.apps.forEach { a ->
-                                put(JSONObject().put("packageName", a.packageName).put("label", a.label)
-                                    .put("ms", a.ms).put("launches", a.launches))
-                            }
-                        })
-                        .put("websites", sitesJson(d.sites)))
+            .put("phone", phoneDaysJson(s.phone.values))
+            .put("phones", JSONArray().apply {
+                s.phones.forEach { p ->
+                    put(JSONObject().put("id", p.id).put("name", p.name).put("lastSeen", p.lastSeen)
+                        .put("days", phoneDaysJson(p.days.values)))
                 }
             })
             .put("browsers", JSONArray().apply {
-                s.browsers.forEach { b ->
-                    put(JSONObject().put("id", b.id).put("name", b.name).put("lastSeen", b.lastSeen)
-                        .put("days", JSONArray().apply {
-                            b.days.values.forEach { d ->
-                                put(JSONObject().put("date", d.date).put("totalMs", d.totalMs).put("sites", sitesJson(d.sites)))
-                            }
-                        }))
-                }
+                s.browsers.forEach { b -> put(browserJson(b).apply { b.via?.let { put("via", it) } }) }
             })
 
         private fun decode(o: JSONObject): UsageSnapshot {
@@ -137,9 +224,18 @@ class UsageStore(context: Context) {
                 BrowserUsage(
                     b.optString("id"), b.optString("name"), b.optLong("lastSeen"),
                     UsageMath.prune(parseBrowserDays(b.optJSONArray("days"), Int.MAX_VALUE).associateBy { d -> d.date }),
+                    via = b.optString("via").ifEmpty { null },
                 )
             }
-            return UsageSnapshot(phone.associateBy { it.date }, o.optBoolean("phoneDetailed", true), o.optLong("phoneReadAt"), browsers)
+            val parr = o.optJSONArray("phones") ?: JSONArray()
+            val phones = (0 until parr.length()).map {
+                val p = parr.getJSONObject(it)
+                PeerPhoneUsage(
+                    p.optString("id"), p.optString("name"), p.optLong("lastSeen"),
+                    UsageMath.prune(parsePhoneHistory(p.optJSONArray("days")?.toString() ?: "[]").associateBy { d -> d.date }),
+                )
+            }
+            return UsageSnapshot(phone.associateBy { it.date }, o.optBoolean("phoneDetailed", true), o.optLong("phoneReadAt"), browsers, phones)
         }
     }
 }

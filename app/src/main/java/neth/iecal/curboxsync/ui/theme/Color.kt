@@ -52,3 +52,7 @@ val DarkColors = darkColorScheme(
     surfaceContainerHigh = Color(0xFF252B2A),
     surfaceContainerHighest = Color(0xFF303634),
 )
+
+/** Other phones' chart colors, picked to sit beside the teal of this phone. */
+val PeerColorsLight = listOf(Color(0xFFC77D1A), Color(0xFF6D5BD0), Color(0xFFC4505E), Color(0xFF2E7DB8))
+val PeerColorsDark = listOf(Color(0xFFF2B866), Color(0xFFB7AAF7), Color(0xFFF29AA5), Color(0xFF8CC4EE))

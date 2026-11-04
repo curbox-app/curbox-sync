@@ -16,15 +16,18 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A deliberately tiny HTTP/1.1 server for the WiFi link. Every request body is sealed with the
- * pairing key, so the transport itself carries no secrets. Only private network peers are served.
+ * pairing key, so the transport itself carries no secrets. Only private network and Tailscale peers are served.
  *
- *   GET  /v1/hello  -> {"app":"curbox-sync","proto":2,...}
+ *   GET  /v1/hello  -> {"app":"curbox-sync","proto":3,...}
  *   POST /v1/rpc    -> sealed request in, sealed response out (401 when it does not open)
+ *   GET/POST /v1/pair -> short code pairing (see [PairCode]); 403 while the app is not open
  */
 class LanServer(
     private val port: Int,
     private val scope: CoroutineScope,
     private val rpc: suspend (String) -> String?,
+    /** Short code pairing: (method, body) to (status, reply). */
+    private val pair: suspend (String, String?) -> Pair<Int, String>,
 ) {
     private var socket: ServerSocket? = null
     private val open = AtomicInteger(0)
@@ -85,7 +88,11 @@ class LanServer(
         when {
             method == "OPTIONS" -> respond(client, 204, "")
             method == "GET" && path == "/v1/hello" -> respond(client, 200, HELLO, "application/json")
-            method == "POST" && path == "/v1/rpc" -> {
+            method == "GET" && path == "/v1/pair" -> {
+                val (status, reply) = pair("GET", null)
+                respond(client, status, reply, "application/json")
+            }
+            method == "POST" && (path == "/v1/rpc" || path == "/v1/pair") -> {
                 val length = headers["content-length"]?.toIntOrNull() ?: return respond(client, 411, "")
                 if (length !in 1..MAX_BODY) return respond(client, 413, "")
                 val body = ByteArray(length)
@@ -94,6 +101,10 @@ class LanServer(
                     val n = input.read(body, read, length - read)
                     if (n < 0) return
                     read += n
+                }
+                if (path == "/v1/pair") {
+                    val (status, reply) = pair("POST", String(body))
+                    return respond(client, status, reply, "application/json")
                 }
                 val reply = rpc(String(body))
                 if (reply == null) respond(client, 401, "") else respond(client, 200, reply)
@@ -119,7 +130,7 @@ class LanServer(
         val bytes = body.toByteArray()
         val reason = when (code) {
             200 -> "OK"; 204 -> "No Content"; 400 -> "Bad Request"; 401 -> "Unauthorized"
-            404 -> "Not Found"; 411 -> "Length Required"; 413 -> "Payload Too Large"; else -> "Error"
+            403 -> "Forbidden"; 404 -> "Not Found"; 411 -> "Length Required"; 413 -> "Payload Too Large"; else -> "Error"
         }
         val head = buildString {
             append("HTTP/1.1 $code $reason\r\n")
@@ -141,16 +152,17 @@ class LanServer(
 
     companion object {
         const val PORT = 47621
-        /** proto 2 adds the `usage` op and the `net` reply field. */
-        private const val HELLO = """{"app":"curbox-sync","proto":2,"features":["usage","net"]}"""
+        /** proto 2 adds the `usage` op and the `net` reply field; proto 3 adds Pomodoro and group sharing. */
+        private const val HELLO = """{"app":"curbox-sync","proto":3,"features":["usage","net","pomodoro","groups","tailnet"]}"""
         private const val TAG = "LanServer"
         private const val MAX_CONNECTIONS = 16
         private const val MAX_HEAD = 8 * 1024
-        private const val MAX_BODY = 64 * 1024
+        private const val MAX_BODY = 512 * 1024
 
-        /** WiFi peers only: private, link local or loopback addresses. */
+        /** WiFi or Tailscale peers only: private, link local, loopback or Tailscale addresses. */
         fun isPrivate(address: InetAddress): Boolean {
             if (address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress) return true
+            if (Tailscale.isTailnet(address)) return true
             return address is Inet6Address && (address.address[0].toInt() and 0xfe) == 0xfc
         }
     }
